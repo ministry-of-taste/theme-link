@@ -1,0 +1,7 @@
+# Copy to ~/.config/theme-link/config, or run: theme-link config init
+# XDG_CONFIG_HOME is respected by the built-in defaults. This example uses ~/.
+# Values are data, never shell code. Only absolute paths or ~/ are supported.
+# Optional outer quotes preserve spaces. Comments must be on separate lines.
+
+store_dir = ~/.config/theme-link-store
+themes_dir = ~/.config/omarchy/themes

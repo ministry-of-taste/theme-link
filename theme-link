@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# theme-link: unsupported, explicit-trust theme checkouts for Omarchy.
+set -euo pipefail
+export LC_ALL=C
+umask 077
+
+VERSION=0.1.0
+config_file=''
+store_dir=''
+themes_dir=''
+temp_dir=''
+pending_clone=''
+pending_clone_id=''
+pending_record=''
+pending_record_id=''
+pending_link=''
+yes=false
+delete=false
+
+say() { printf '%s\n' "$*" >&2; }
+die() { say "theme-link: $*"; exit 1; }
+exists() { [[ -e $1 || -L $1 ]]; }
+require() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+
+usage() {
+  # shellcheck disable=SC2016 # Show the XDG variable literally in help.
+  printf '%s\n' 'theme-link — unsupported Git-backed themes for Omarchy
+
+Usage:
+  theme-link [--config FILE] add GIT_URL [NAME] [--yes]
+  theme-link [--config FILE] link NAME [--yes]
+  theme-link [--config FILE] list
+  theme-link [--config FILE] remove NAME [--delete] [--yes]
+  theme-link [--config FILE] config [show|path|init]
+  theme-link --help | --version
+
+Commands:
+  add       Clone a theme and symlink it into Omarchy. Never activates it.
+  link      Re-link a checkout retained after removal. Shows the trust warning.
+  list      Show managed checkouts and their link status. Does not fetch.
+  remove    Unlink a managed theme; keep its checkout unless --delete is given.
+  config    Show resolved settings, print the config path, or create a config.
+
+Options:
+  --config FILE  Use another config file (path/init may name a missing file).
+  --yes, -y      Explicitly accept the warning/confirmation; warnings still print.
+  --delete       Permanently delete the managed checkout, including local work.
+  --             End option parsing (for positional arguments beginning with -).
+
+Default config: $XDG_CONFIG_HOME/theme-link/config
+Default store:  $XDG_CONFIG_HOME/theme-link-store
+Default links:  $XDG_CONFIG_HOME/omarchy/themes
+XDG_CONFIG_HOME falls back to ~/.config.
+
+WARNING: UNSUPPORTED. Themes can contain executable code. Only link themes
+from sources you trust. A checkout directory is not a sandbox.'
+}
+
+trim() {
+  REPLY=${1#"${1%%[!$' \t']*}"}
+  REPLY=${REPLY%"${REPLY##*[!$' \t']}"}
+}
+
+absolute_path() {
+  local value=$1
+  [[ -n $value && ! $value =~ [[:cntrl:]] ]] || die 'Paths must be nonempty and contain no control characters.'
+  case $value in
+    '~') value=$HOME ;;
+    \~/*) value="$HOME/${value:2}" ;;
+    /*) ;;
+    *) die 'Use an absolute path or a path beginning with ~/.' ;;
+  esac
+  REPLY=$(realpath -m -- "$value") || die 'Could not resolve path.'
+}
+
+config_error() { die "$config_file:$line_number: $*"; }
+
+load_config() {
+  local line key value line_number=0
+  local seen_store=false seen_themes=false
+  if ! exists "$config_file"; then
+    [[ $explicit_config == false ]] || die "Config does not exist: $config_file (use config init to create it)."
+    return
+  fi
+  [[ -f $config_file && -r $config_file ]] || die "Config is not a readable regular file: $config_file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    line_number=$((line_number + 1))
+    line=${line%$'\r'}
+    trim "$line"; line=$REPLY
+    [[ -n $line && $line != \#* ]] || continue
+    [[ $line == *=* ]] || config_error 'Expected key = value.'
+    trim "${line%%=*}"; key=$REPLY
+    trim "${line#*=}"; value=$REPLY
+    if [[ $value == \"*\" || $value == \'*\' ]]; then
+      value=${value:1:${#value}-2}
+    fi
+    case $key in
+      store_dir)
+        [[ $seen_store == false ]] || config_error 'Duplicate key: store_dir'
+        seen_store=true
+        absolute_path "$value"; store_dir=$REPLY
+        ;;
+      themes_dir)
+        [[ $seen_themes == false ]] || config_error 'Duplicate key: themes_dir'
+        seen_themes=true
+        absolute_path "$value"; themes_dir=$REPLY
+        ;;
+      *) config_error "Unknown key: $(printf '%q' "$key")" ;;
+    esac
+  done <"$config_file"
+}
+
+validate_layout() {
+  [[ $store_dir != / && $themes_dir != / ]] || die 'The filesystem root cannot be a store or themes directory.'
+  [[ $store_dir != "$themes_dir" && $store_dir != "$themes_dir/"* && $themes_dir != "$store_dir/"* ]] ||
+    die 'store_dir and themes_dir must be separate, non-nested directories.'
+  [[ $config_file != "$store_dir" && $config_file != "$store_dir/"* &&
+     $config_file != "$themes_dir" && $config_file != "$themes_dir/"* ]] ||
+    die 'Keep the config file outside the store and themes directories.'
+  registry_dir="$store_dir/.theme-link"
+}
+
+valid_name() { [[ ${#1} -le 80 && $1 =~ ^[a-z0-9][a-z0-9_-]*$ ]]; }
+check_name() { valid_name "$1" || die 'Theme names must be 1–80 lowercase ASCII letters, digits, hyphens or underscores, starting with a letter or digit.'; }
+
+validate_url() {
+  [[ -n $1 && ! $1 =~ [[:cntrl:]] && $1 != -* && $1 != *::* ]] || die 'Invalid Git URL; options, control characters and remote helpers are not allowed.'
+  case $1 in
+    https://?*/* | ssh://?*/* | file:///* | /*) ;;
+    *://*) die 'Only HTTPS, SSH and local file URL transports are supported.' ;;
+    *) [[ $1 =~ ^([a-zA-Z0-9._-]+@)?[a-zA-Z0-9][a-zA-Z0-9._-]*:.+$ ]] ||
+      die 'Use HTTPS, SSH, an scp-style SSH URL, file:///path, or an absolute local repository path.' ;;
+  esac
+}
+
+derive_name() {
+  local path=${1%/}
+  if [[ $path != *://* && $path == *:* && ${path%%:*} != */* ]]; then
+    path=${path#*:}
+  fi
+  path=${path##*/}
+  path=${path,,}
+  path=${path%.git}
+  path=${path#omarchy-}
+  REPLY=${path%-theme}
+}
+
+trust_warning() {
+  say ''
+  say '======================================================================'
+  say 'WARNING — UNSUPPORTED THEME INSTALLATION — EXECUTABLE CODE'
+  say '======================================================================'
+  say 'This is NOT the supported Omarchy theme installer.'
+  say 'Symlinked themes may bypass Omarchy restrictions for installed Git themes.'
+  say 'Themes can contain executable code. Applying or using a theme can run it'
+  say 'with your user permissions, including access to your files and credentials.'
+  say 'Only use themes from sources you trust. This store is NOT a sandbox.'
+  say 'No theme code is intentionally run by theme-link; Git and SSH must also'
+  say 'be trusted and kept up to date. Compatibility is not guaranteed.'
+  say 'theme-link does not activate themes, fetch updates, or run theme scripts.'
+  say '======================================================================'
+  say ''
+}
+
+confirm() {
+  local answer
+  [[ $yes == false ]] || return 0
+  [[ -t 0 ]] || die 'Confirmation requires a terminal. Review the warning and explicitly pass --yes for noninteractive use.'
+  printf '%s [y/N] ' "$1" >&2
+  if ! IFS= read -r answer; then
+    die 'Cancelled; no changes made.'
+  fi
+  case $answer in y|Y|yes|YES) ;; *) die 'Cancelled; no changes made.' ;; esac
+}
+
+# Resolve configured directory symlinks once; refuse changes to those paths
+# during an operation. This is accident protection, not isolation from the user.
+check_roots() {
+  [[ $(realpath -m -- "$store_dir") == "$store_dir" &&
+     $(realpath -m -- "$themes_dir") == "$themes_dir" ]] || die 'A configured directory changed; retry after checking your paths.'
+  if exists "$registry_dir"; then
+    [[ -d $registry_dir && ! -L $registry_dir ]] || die "Unsafe managed-state directory: $registry_dir"
+  fi
+}
+
+lock_store() {
+  local mode=$1
+  [[ -d $store_dir ]] || die "Store is not a directory: $store_dir"
+  check_roots
+  # Linux flock can lock the directory itself: no writable lock file to follow.
+  exec {lock_fd}<"$store_dir"
+  flock --nonblock "$mode" "$lock_fd" || die 'Store is busy; another theme-link operation is running. Try again when it finishes.'
+}
+
+owned_record() {
+  [[ -f $registry_dir/$1 && ! -L $registry_dir/$1 && $(<"$registry_dir/$1") == theme-link-v1 ]]
+}
+
+check_owned() {
+  owned_record "$1" || die "Not a managed checkout: $1. No changes made."
+}
+
+check_checkout() {
+  local checkout="$store_dir/$1"
+  [[ -d $checkout && ! -L $checkout && -d $checkout/.git && ! -L $checkout/.git ]] ||
+    die "Missing or unsafe Git checkout: $checkout"
+}
+
+check_theme() {
+  local file
+  for file in colors.toml alacritty.toml; do
+    if [[ -f $1/$file && ! -L $1/$file && -s $1/$file ]]; then
+      return 0
+    fi
+  done
+  die 'Not a supported theme layout: expected a nonempty, non-symlink colors.toml or legacy alacritty.toml at the repository root. No theme code was run.'
+}
+
+link_matches() {
+  [[ -L $themes_dir/$1 && $(realpath -m -- "$themes_dir/$1") == "$store_dir/$1" ]]
+}
+
+create_link() {
+  local name=$1
+  check_roots
+  exists "$themes_dir/$name" && die "Refusing to overwrite: $themes_dir/$name"
+  # -T refuses to create a link *inside* a directory that appears at this path.
+  pending_link=$name
+  ln -sT -- "$store_dir/$name" "$themes_dir/$name" || die 'Could not create theme symlink.'
+  link_matches "$name" || die 'Symlink verification failed.'
+}
+
+same_object() {
+  [[ -n $2 && $(stat -c '%d:%i' -- "$1" 2>/dev/null || true) == "$2" ]]
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n $pending_link ]] && link_matches "$pending_link"; then
+    rm -f -- "$themes_dir/$pending_link" || say 'Could not roll back the new symlink.'
+  fi
+  if [[ -n $pending_record ]] && same_object "$pending_record" "$pending_record_id"; then
+    rm -f -- "$pending_record" || say 'Could not roll back the new management record.'
+  fi
+  if [[ -n $pending_clone ]] && same_object "$pending_clone" "$pending_clone_id"; then
+    rm -rf --one-file-system -- "$pending_clone" || say "Could not roll back the new checkout: $pending_clone"
+  fi
+  if [[ -n $temp_dir ]]; then
+    rm -rf --one-file-system -- "$temp_dir" || say "Could not remove temporary checkout: $temp_dir"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+clone_theme() {
+  # Do not inherit user Git filters, URL rewrites, hooks, templates, config
+  # injection, alternate worktrees, or remote-helper overrides. SSH still uses
+  # the user's SSH config/agent. The checkout is not a sandbox.
+  env -u GIT_CONFIG -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+    -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -u GIT_NAMESPACE -u GIT_TEMPLATE_DIR -u GIT_EXEC_PATH \
+    -u GIT_SSH -u GIT_SSH_COMMAND -u GIT_PROXY_COMMAND \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS='' GIT_ATTR_NOSYSTEM=1 \
+    GIT_ALLOW_PROTOCOL=https:ssh:file GIT_TERMINAL_PROMPT=0 \
+    git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false \
+    clone --quiet --no-local --no-recurse-submodules --template= -- "$1" "$2"
+}
+
+add_theme() {
+  local url=$1 name=$2 checkout record
+  validate_url "$url"
+  if [[ -z $name ]]; then derive_name "$url"; name=$REPLY; fi
+  check_name "$name"
+  require git
+  checkout="$store_dir/$name"
+  record="$registry_dir/$name"
+  check_roots
+  exists "$themes_dir/$name" && die "Refusing to overwrite: $themes_dir/$name"
+  exists "$checkout" && die "Checkout already exists: $checkout. Use 'theme-link link $name' to re-link a managed checkout."
+  exists "$record" && die "Management record already exists for $name; inspect the store before continuing."
+  trust_warning
+  say "Theme:    $name"
+  say "Source:   $url"
+  say "Checkout: $checkout"
+  say "Link:     $themes_dir/$name"
+  confirm 'Trust this source and clone/link the theme?'
+
+  mkdir -p -- "$store_dir" "$themes_dir"
+  lock_store --exclusive
+  # Recheck after confirmation and acquiring the lock.
+  exists "$checkout" && die "Refusing to overwrite: $checkout"
+  exists "$themes_dir/$name" && die "Refusing to overwrite: $themes_dir/$name"
+  exists "$record" && die "Refusing to overwrite: $record"
+  mkdir -p -- "$registry_dir"
+  temp_dir=$(mktemp -d "$store_dir/.theme-link-tmp.XXXXXXXX")
+  say "Cloning $name…"
+  clone_theme "$url" "$temp_dir/checkout" || die 'Clone failed; temporary files will be removed.'
+  check_theme "$temp_dir/checkout"
+  # Remember inode identity *before* each move: a signal after mv must still
+  # roll back our object, never a conflicting object someone else created.
+  pending_clone=$checkout
+  pending_clone_id=$(stat -c '%d:%i' -- "$temp_dir/checkout")
+  mv -T -n -- "$temp_dir/checkout" "$checkout"
+  [[ ! -e $temp_dir/checkout ]] || die "Refusing to overwrite: $checkout"
+  printf '%s\n' theme-link-v1 >"$temp_dir/record"
+  pending_record=$record
+  pending_record_id=$(stat -c '%d:%i' -- "$temp_dir/record")
+  mv -T -n -- "$temp_dir/record" "$record"
+  [[ ! -e $temp_dir/record ]] || die "Refusing to overwrite: $record"
+  create_link "$name"
+  pending_clone=''; pending_record=''; pending_link=''
+  say "Linked $name. Not activated."
+  say "Apply manually when ready: omarchy theme set $name"
+}
+
+relink_theme() {
+  local name=$1
+  check_name "$name"
+  lock_store --exclusive
+  check_owned "$name"
+  check_checkout "$name"
+  check_theme "$store_dir/$name"
+  exists "$themes_dir/$name" && die "Refusing to overwrite: $themes_dir/$name"
+  trust_warning
+  say "Checkout: $store_dir/$name"
+  say "Link:     $themes_dir/$name"
+  confirm 'Trust this checkout and link the theme?'
+  check_checkout "$name"
+  mkdir -p -- "$themes_dir"
+  create_link "$name"
+  pending_link=''
+  say "Linked $name. Not activated."
+}
+
+list_themes() {
+  local record name status count=0
+  if ! exists "$store_dir"; then
+    printf '%s\n' 'No managed themes.'
+    return
+  fi
+  lock_store --shared
+  for record in "$registry_dir"/*; do
+    exists "$record" || continue
+    name=${record##*/}
+    if ! valid_name "$name" || ! owned_record "$name"; then continue; fi
+    count=$((count + 1))
+    if [[ -L $store_dir/$name ]]; then status=unsafe
+    elif [[ ! -d $store_dir/$name ]]; then status=missing
+    elif [[ ! -d $store_dir/$name/.git || -L $store_dir/$name/.git ]]; then status=unsafe
+    elif link_matches "$name"; then status=linked
+    elif exists "$themes_dir/$name"; then status=conflict
+    else status=unlinked
+    fi
+    printf '%s\t%s\n' "$name" "$status"
+  done
+  (( count > 0 )) || printf '%s\n' 'No managed themes.'
+}
+
+remove_theme() {
+  local name=$1 checkout
+  check_name "$name"
+  lock_store --exclusive
+  check_owned "$name"
+  checkout="$store_dir/$name"
+  [[ ! -L $checkout ]] || die "Refusing a symlinked checkout: $checkout"
+  if exists "$themes_dir/$name"; then
+    link_matches "$name" || die "Refusing to remove an unmanaged path: $themes_dir/$name"
+  elif [[ $delete == false ]]; then
+    die "Theme $name is already unlinked; checkout kept at $checkout."
+  fi
+  if [[ $delete == true ]]; then
+    # A missing checkout is allowed so a stale owned record can be removed.
+    if exists "$checkout"; then check_checkout "$name"; fi
+    say "PERMANENT DELETE: $checkout"
+    say 'This removes ALL local files, edits and Git history, including local commits.'
+    say 'There is no trash or undo. The active Omarchy theme is not changed.'
+    confirm "Unlink and permanently delete $name?"
+  else
+    say "Unlink: $themes_dir/$name"
+    say "Keep:   $checkout"
+    confirm "Unlink $name (keep its checkout)?"
+  fi
+  check_roots
+  [[ ! -L $checkout ]] || die "Refusing a symlinked checkout: $checkout"
+  if exists "$themes_dir/$name"; then
+    link_matches "$name" || die 'Theme link changed; no changes made.'
+    rm -- "$themes_dir/$name"
+  fi
+  if [[ $delete == true ]]; then
+    if exists "$checkout"; then
+      check_checkout "$name"
+      rm -rf --one-file-system -- "$checkout" || die 'Unlinked, but checkout deletion failed; the management record has been kept.'
+      ! exists "$checkout" || die 'Unlinked, but checkout remains; the management record has been kept.'
+    fi
+    rm -- "$registry_dir/$name"
+    say "Removed $name and its checkout. The active Omarchy theme was not changed."
+  else
+    say "Unlinked $name. Checkout kept at $checkout"
+  fi
+}
+
+config_command() {
+  case $1 in
+    path) printf '%s\n' "$config_file" ;;
+    show) printf 'store_dir = "%s"\nthemes_dir = "%s"\n' "$store_dir" "$themes_dir" ;;
+    init)
+      exists "$config_file" && die "Refusing to overwrite config: $config_file"
+      validate_layout
+      mkdir -p -- "${config_file%/*}"
+      (set -o noclobber
+        printf '# theme-link config. Values are data, never shell code.\n# Absolute paths or ~/; optional outer quotes. No inline comments.\nstore_dir = "%s"\nthemes_dir = "%s"\n' \
+          "$store_dir" "$themes_dir" >"$config_file"
+      ) || die 'Could not create config without overwriting an existing file.'
+      say "Created $config_file"
+      ;;
+  esac
+}
+
+# Parse before loading configuration: --help and --version must work even when
+# configuration is broken. Options may appear before or after the command.
+explicit_config=false
+end_options=false
+args=()
+while (( $# > 0 )); do
+  if [[ $end_options == true ]]; then args+=("$1"); shift; continue; fi
+  case $1 in
+    --help|-h) usage; exit 0 ;;
+    --version) printf 'theme-link %s\n' "$VERSION"; exit 0 ;;
+    --config)
+      (( $# >= 2 )) || die '--config needs a file path.'
+      [[ $explicit_config == false ]] || die '--config may only be specified once.'
+      [[ -n $2 ]] || die '--config needs a nonempty file path.'
+      config_file=$2; explicit_config=true; shift 2 ;;
+    --yes|-y) yes=true; shift ;;
+    --delete) delete=true; shift ;;
+    --) end_options=true; shift ;;
+    -*) die "Unknown option: $(printf '%q' "$1"). See theme-link --help." ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+(( ${#args[@]} > 0 )) || { usage; exit 0; }
+command=${args[0]}
+case $command in
+  add)
+    (( ${#args[@]} == 2 || ${#args[@]} == 3 )) || die 'Usage: theme-link add GIT_URL [NAME] [--yes]'
+    if (( ${#args[@]} == 3 )); then check_name "${args[2]}"; fi
+    ;;
+  link|remove) (( ${#args[@]} == 2 )) || die "Usage: theme-link $command NAME" ;;
+  list) (( ${#args[@]} == 1 )) || die 'Usage: theme-link list' ;;
+  config)
+    (( ${#args[@]} <= 2 )) || die 'Usage: theme-link config [show|path|init]'
+    case ${args[1]:-show} in show|path|init) ;; *) die 'Usage: theme-link config [show|path|init]' ;; esac
+    ;;
+  *) die "Unknown command: $(printf '%q' "$command"). See theme-link --help." ;;
+esac
+[[ $delete == false || $command == remove ]] || die '--delete is only valid with remove.'
+[[ $yes == false || $command == add || $command == link || $command == remove ]] || die '--yes is only valid with add, link or remove.'
+
+require realpath
+[[ ${HOME:-} == /* && ! $HOME =~ [[:cntrl:]] ]] || die 'HOME must be an absolute path without control characters.'
+absolute_path "${XDG_CONFIG_HOME:-$HOME/.config}"; config_home=$REPLY
+absolute_path "$config_home/theme-link-store"; store_dir=$REPLY
+absolute_path "$config_home/omarchy/themes"; themes_dir=$REPLY
+absolute_path "${config_file:-$config_home/theme-link/config}"; config_file=$REPLY
+if [[ $command == config && ${args[1]:-show} != show ]]; then
+  config_command "${args[1]}"
+  exit 0
+fi
+load_config
+validate_layout
+case $command in
+  add) require flock; add_theme "${args[1]}" "${args[2]:-}" ;;
+  link) require flock; relink_theme "${args[1]}" ;;
+  list) require flock; list_themes ;;
+  remove) require flock; remove_theme "${args[1]}" ;;
+  config) config_command show ;;
+esac
